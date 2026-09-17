@@ -435,6 +435,17 @@ write_generated_config() {
   mv "$tmp" "$GENERATED_CONFIG"
   chmod 644 "$GENERATED_CONFIG"
   ok "wrote $(tildify "$GENERATED_CONFIG")"
+
+  # The manifest is what `mise bootstrap --adopt` reads on a fresh machine, so it
+  # has to be published like anything else - written but untracked, it never
+  # reaches the snapshot and a restore sees no packages, repos or service.
+  # It is tracked here rather than through CONFIG_CANDIDATES because it does not
+  # exist yet when discovery and apply_tracking run on a first install.
+  if mise dot track -y "$GENERATED_CONFIG" >/dev/null 2>&1; then
+    ok "tracking $(tildify "$GENERATED_CONFIG")"
+  else
+    warn "could not track $(tildify "$GENERATED_CONFIG"); a restore will not see it"
+  fi
 }
 
 start_watcher() {
