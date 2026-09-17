@@ -29,6 +29,29 @@ rm -rf ~/.local/state/mise/history
 # then remove the [dotfiles] and [history] blocks from ~/.config/mise/config.toml
 ```
 
+## The harness itself must stay boxed in
+
+`test/run.sh` boots a container whose PID 1 is systemd. systemd manages whatever
+cgroup tree it is shown, so the box has to get its own cgroup namespace. An
+earlier version of the harness ran the box with `--cgroupns=host` and
+`-v /sys/fs/cgroup:/sys/fs/cgroup:rw`; the container's systemd adopted the
+*host's* units, tore down the Hyprland session, locked sddm out of tty1 and took
+the machine down about two seconds after the first container started.
+
+The rules that follow from that:
+
+- the box runs `--cgroupns=private`, and the host cgroupfs is never bind-mounted
+- the box is **not** `--privileged`. It gets `--cap-add SYS_ADMIN`, and
+  `test/box-init.sh` (PID 1) remounts the private cgroup tree rw before exec'ing
+  systemd. Docker only mounts that tree rw for privileged containers, and
+  `--privileged` would also hand the box the host's `/dev` - including the root
+  device-mapper nodes, which showed up as a live `dev-mapper-omarchy_root.device`
+  unit inside the box while this was being fixed
+- `start_container` compares `/proc/self/ns/cgroup` inside the box against the
+  host's and refuses to proceed if they match
+- console and getty units are masked in the image, so the box cannot race the
+  host for tty1
+
 ## Status of the code
 
 | Path | State |
@@ -36,12 +59,14 @@ rm -rf ~/.local/state/mise/history
 | `--dry-run`, discovery, classification, plan output | Exercised on a live Omarchy machine |
 | Argument parsing and validation | Exercised, including malformed input |
 | Manifest generation (`[bootstrap.*]` TOML) | Generated and validated against `tomllib` |
-| **Full apply path on a fresh machine** | **Never run end-to-end. This is the risk area.** |
-| Remote creation, `origin set`, publish, verify | Only ever run by hand, not through this script |
+| Full local apply path (`--no-remote -y`) | Exercised end-to-end by `test/run.sh` in a fresh container |
+| Remote creation, `origin set`, publish, verify | **Only ever run by hand. Still the risk area.** |
 | Restore (`mise bootstrap --adopt`) | Never tested from a snapshot produced by this script |
 
-The equivalent steps were performed manually on one machine and worked; the script
-automating them has not been proven on a clean system.
+The local half is covered: `03-apply` runs the real apply path in a disposable box and
+checks the history repository mise builds from it. The remote half is not - `04-matrix`
+only proves that an absent or unauthenticated `gh` fails cleanly instead of hanging.
+Nothing has yet restored a machine from a snapshot this script produced.
 
 ## Invariants worth asserting
 
@@ -106,9 +131,10 @@ as the repository name and the tool proceeded in live mode.
 
 ## Known weak points
 
-- **No isolation mechanism.** Testing the apply path safely requires a disposable machine.
-  A `--prefix` that redirected mise's config and state would make this tool far easier to
-  verify, and does not exist.
+- **No `--prefix`.** `test/run.sh` supplies the disposable machine, so the apply path can
+  be tested safely, but the tool itself still has no way to redirect mise's config and
+  state. `OMARCHY_SNAPSHOT_CONFIG` moves only the generated manifest. Testing outside a
+  container is still unsafe, which is why `require_container` exists.
 - **`confirm()` reads from `/dev/tty`.** Without a terminal it fails, which currently
   causes an abort. That is a safe default but an accidental one, not a designed one.
 - **The verification step is a backstop, not a proof.** It scans for a handful of
@@ -120,7 +146,9 @@ as the repository name and the tool proceeded in live mode.
 - **Ordering assumption.** The tool relies on `mise dot exclude` taking effect before
   `mise dot track` captures a baseline. If mise ever changes that ordering, secrets could
   be captured. Invariant 2 above is the test that would catch it.
-- **No automated test suite.** Everything here is currently manual.
+- **The suite proves invariants, not correctness of the restore.** 112 assertions pass,
+  but every one of them inspects the machine the snapshot was taken *from*. Nothing
+  checks that the snapshot can rebuild a different machine.
 
 ## Suggested first session
 
