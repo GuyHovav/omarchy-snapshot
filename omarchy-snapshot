@@ -523,9 +523,17 @@ verify() {
 main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --remote)           REMOTE_ARG="${2:-}"; shift 2 ;;
+      --remote)
+        # A value starting with '-' is a missing value, not a repository: without
+        # this check `--remote --dry-run` would swallow the flag and run for real.
+        [[ $# -ge 2 && -n ${2:-} && $2 != -* ]] || die "--remote needs a value: owner/repo, or a full git URL"
+        REMOTE_ARG="$2"; shift 2 ;;
       --no-remote)        SKIP_REMOTE=1; shift ;;
-      --max-binary-size)  MAX_BINARY_BYTES="${2:-}"; shift 2 ;;
+      --max-binary-size)
+        [[ $# -ge 2 && -n ${2:-} && $2 != -* ]] || die "--max-binary-size needs a value in bytes"
+        [[ $2 =~ ^[0-9]+$ ]] || die "--max-binary-size must be a whole number of bytes, got '$2'"
+        (( $2 > 0 )) || die "--max-binary-size must be greater than zero"
+        MAX_BINARY_BYTES="$2"; shift 2 ;;
       -n|--dry-run)       DRY_RUN=1; shift ;;
       -y|--yes)           ASSUME_YES=1; shift ;;
       -h|--help)          usage; exit 0 ;;
@@ -534,8 +542,15 @@ main() {
     esac
   done
 
+  if [[ -n $REMOTE_ARG && $SKIP_REMOTE -eq 1 ]]; then
+    die "--remote and --no-remote cannot be used together"
+  fi
+
   say "${c_bold}omarchy-snapshot $VERSION${c_reset}"
   [[ $DRY_RUN -eq 1 ]] && dim "dry run - nothing will be changed"
+  if [[ -z $REMOTE_ARG && $SKIP_REMOTE -eq 0 ]]; then
+    dim "no --remote given - setting up local history only"
+  fi
 
   preflight
   discover_secrets

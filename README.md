@@ -83,6 +83,14 @@ stale. Recovering means force-pushing the branch back to mise's last published c
 So the repository has no root README, and anything you want in it has to arrive as a
 tracked file.
 
+## Status
+
+The discovery, classification and `--dry-run` paths are exercised on a live Omarchy
+machine. The **full apply path has not been run end-to-end on a clean system** — the
+equivalent steps were done by hand and worked, but the script automating them is
+unproven there. Start with `--dry-run`, and see [TESTING.md](TESTING.md) before running
+it for real.
+
 ## Requirements
 
 - `mise` 2026.9.2 or newer (for `mise dot`)
