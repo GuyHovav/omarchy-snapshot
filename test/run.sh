@@ -16,7 +16,7 @@ REPO=$(cd .. && pwd)
 IMAGE=${IMAGE:-omarchy-snapshot-test}
 DOCKER=${DOCKER:-docker}
 
-ALL_CASES=(01-args 02-dryrun 03-apply 04-matrix)
+ALL_CASES=(01-args 02-dryrun 03-apply 04-matrix 05-restore)
 
 b=$'\033[1m'; g=$'\033[32m'; r=$'\033[31m'; y=$'\033[33m'; d=$'\033[2m'; z=$'\033[0m'
 [[ -t 1 ]] || { b=''; g=''; r=''; y=''; d=''; z=''; }
