@@ -60,13 +60,19 @@ The rules that follow from that:
 | Argument parsing and validation | Exercised, including malformed input |
 | Manifest generation (`[bootstrap.*]` TOML) | Generated and validated against `tomllib` |
 | Full local apply path (`--no-remote -y`) | Exercised end-to-end by `test/run.sh` in a fresh container |
-| Remote creation, `origin set`, publish, verify | **Only ever run by hand. Still the risk area.** |
-| Restore (`mise bootstrap --adopt`) | Never tested from a snapshot produced by this script |
+| Publish, verify, and restore against a local remote | Round-tripped by `05-restore` |
+| **GitHub specifically: `gh repo create`, auth, push** | **Only ever run by hand. Still the risk area.** |
 
-The local half is covered: `03-apply` runs the real apply path in a disposable box and
-checks the history repository mise builds from it. The remote half is not - `04-matrix`
-only proves that an absent or unauthenticated `gh` fails cleanly instead of hanging.
-Nothing has yet restored a machine from a snapshot this script produced.
+`03-apply` runs the real apply path in a disposable box and checks the history
+repository mise builds from it. `05-restore` goes further: it publishes to a bare
+repository, empties `$HOME`, rebuilds the machine with `mise bootstrap --adopt`, and
+checks that what comes back matches what went in - and that the excluded files are
+still absent afterwards. That works offline because `--adopt` takes a full git URL,
+not only an `owner/repo` shorthand, so `file://` stands in for the remote.
+
+What remains untested is GitHub itself. `04-matrix` proves only that an absent or
+unauthenticated `gh` fails cleanly instead of hanging; no test creates a real
+repository, authenticates, or pushes over the network.
 
 ## Invariants worth asserting
 
@@ -149,9 +155,11 @@ as the repository name and the tool proceeded in live mode.
 - **Ordering assumption.** The tool relies on `mise dot exclude` taking effect before
   `mise dot track` captures a baseline. If mise ever changes that ordering, secrets could
   be captured. Invariant 2 above is the test that would catch it.
-- **The suite proves invariants, not correctness of the restore.** 112 assertions pass,
-  but every one of them inspects the machine the snapshot was taken *from*. Nothing
-  checks that the snapshot can rebuild a different machine.
+- **The restore test rebuilds a home, not a machine.** `05-restore` empties `$HOME` and
+  adopts into it, which covers the dotfiles and proves the manifest survives the round
+  trip and can drive `mise bootstrap plan`. It does not install packages, create users,
+  or apply privileged files, and it reuses one container rather than a genuinely fresh
+  OS install, so the package and system phases of a bootstrap remain unproven.
 
 ## Suggested first session
 
