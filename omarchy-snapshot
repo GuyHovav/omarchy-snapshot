@@ -134,6 +134,26 @@ EOF
 
 # ---------------------------------------------------------------- preflight
 
+# `mise --version` is not a read-only probe: it initialises mise's cache, state
+# and data trees under $HOME (and fetches an update check into
+# ~/.cache/mise/latest-version). On a --dry-run that left a mise tree behind on
+# machines that never had one, which breaks the promise that planning changes
+# nothing. Point those three directories at a scratch dir for the probe only -
+# every later `mise dot` call must still see the real state.
+#
+# `mise dot --help` creates nothing, so the capability check below needs no
+# such treatment.
+mise_version() {
+  local scratch out
+  scratch=$(mktemp -d)
+  out=$(MISE_CACHE_DIR="$scratch/cache" \
+        MISE_STATE_DIR="$scratch/state" \
+        MISE_DATA_DIR="$scratch/data" \
+        mise --version 2>/dev/null)
+  rm -rf "$scratch"
+  printf '%s\n' "$out"
+}
+
 preflight() {
   head1 "Checking prerequisites"
 
@@ -141,9 +161,9 @@ preflight() {
   command -v git  >/dev/null || die "git is not installed."
 
   if ! mise dot --help >/dev/null 2>&1; then
-    die "this mise has no 'dot' command; dotfile history needs mise 2026.9.2 or newer (yours: $(mise --version 2>/dev/null | head -1))"
+    die "this mise has no 'dot' command; dotfile history needs mise 2026.9.2 or newer (yours: $(mise_version | head -1))"
   fi
-  ok "mise $(mise --version 2>/dev/null | awk '{print $1}') with dotfile history"
+  ok "mise $(mise_version | awk '{print $1}') with dotfile history"
 
   if [[ -n $REMOTE_ARG && $REMOTE_ARG != *://* && $REMOTE_ARG != git@* ]]; then
     command -v gh >/dev/null || die "--remote '$REMOTE_ARG' needs the gh CLI to resolve, or pass a full git URL"
