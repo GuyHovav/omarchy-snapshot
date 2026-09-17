@@ -524,16 +524,35 @@ verify() {
 
   head1 "Verifying what was published"
 
-  local url tmp
-  url=$(mise dot status 2>/dev/null | sed -n 's/.*Setup repository: \([^ ]*\).*/\1/p' | head -1)
+  local url branch tmp recorded
+  recorded=$(mise dot status 2>/dev/null | sed -n 's/.*Setup repository: //p' | head -1)
+  url=$(printf '%s' "$recorded" | sed -n 's/^\([^ ]*\).*/\1/p')
   [[ -n $url ]] || { warn "no remote recorded; skipping verification"; return 0; }
+
+  # mise publishes to its own branch, which is not necessarily the remote's
+  # default HEAD - a repository created with plain `git init` still points HEAD
+  # at master. Cloning the default then yields an empty tree, and every check
+  # below would pass for the wrong reason.
+  branch=$(printf '%s' "$recorded" | sed -n 's/.*(branch \([^,)]*\).*/\1/p')
 
   tmp=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" RETURN
 
-  if ! git clone -q --depth 1 "$url" "$tmp/repo" 2>/dev/null; then
-    warn "could not clone $url to verify"
+  local -a clone=(git clone -q --depth 1)
+  [[ -n $branch ]] && clone+=(--branch "$branch")
+  if ! "${clone[@]}" "$url" "$tmp/repo" 2>/dev/null; then
+    warn "could not clone ${branch:+branch $branch of }$url to verify"
+    return 0
+  fi
+
+  # Establish there is something to inspect before trusting anything below: on an
+  # empty checkout the size and credential scans both come back clean, which
+  # reads as an all-clear when in truth nothing was examined at all.
+  local count
+  count=$(find "$tmp/repo/home" -type f 2>/dev/null | wc -l)
+  if (( count == 0 )); then
+    warn "nothing was published to $url - the snapshot is empty, so a restore would rebuild nothing. Do not rely on this snapshot."
     return 0
   fi
 
@@ -553,7 +572,7 @@ verify() {
     ok "no credential patterns found"
   fi
 
-  ok "$(find "$tmp/repo/home" -type f 2>/dev/null | wc -l) file(s) published"
+  ok "$count file(s) published"
 }
 
 # ---------------------------------------------------------------- main
