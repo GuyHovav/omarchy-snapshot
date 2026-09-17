@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+#
+# omarchy-snapshot - continuously snapshot an Omarchy/Arch machine's
+# configuration to a private git remote, using mise's built-in dotfile history.
+#
+# The rule is manifest, not artifacts: track what rebuilds the machine, not what
+# a rebuild would download. Config and hand-written scripts are tracked; binaries,
+# vendored plugins and installed packages are recorded as a list to reinstall.
+#
+# https://github.com/GuyHovav/omarchy-snapshot
+
+set -euo pipefail
+
+VERSION="1.0.0"
+# Overridable so the generated manifest can be inspected without touching a
+# configured machine.
+GENERATED_CONFIG="${OMARCHY_SNAPSHOT_CONFIG:-$HOME/.config/mise/conf.d/omarchy-snapshot.toml}"
+
+DRY_RUN=0
+ASSUME_YES=0
+REMOTE_ARG=""
+SKIP_REMOTE=0
+MAX_BINARY_BYTES=$((1024 * 1024))
+
+# Populated by discovery.
+declare -a TRACK_PATHS=()
+declare -a EXCLUDE_GLOBS=()
+declare -a REPO_PATHS=() REPO_URLS=()
+declare -a WARNINGS=()
+
+# Config entries under ~/.config that are genuinely hand-edited. Anything not
+# listed here is reported at the end rather than tracked, because ~/.config is
+# mostly application state (browser profiles run to hundreds of megabytes).
+CONFIG_CANDIDATES=(
+  hypr omarchy
+  alacritty foot kitty ghostty wezterm
+  nvim helix zellij tmux
+  btop lazygit git gh/config.yml
+  mpv imv zathura
+  starship.toml opencode fish
+  systemd/user mise/config.toml
+)
+
+HOME_CANDIDATES=(
+  .bashrc .bash_profile .bash_aliases .profile
+  .zshrc .zprofile .zshenv
+  .inputrc .gitconfig .gitignore_global .tmux.conf
+)
+
+# Credential-bearing paths, always excluded. mise applies its own *token*/*secret*
+# globs as well; this is deliberate belt-and-braces.
+SECRET_GLOBS=(
+  '**/*token*' '**/*secret*' '**/*credential*' '**/*password*'
+  '**/.netrc' '**/auth.json' '**/hosts.yml'
+  '**/*.key' '**/*.pem' '**/id_rsa*' '**/id_ed25519*'
+)
+
+# Churn with no configuration value.
+NOISE_GLOBS=(
+  '**/*.bak' '**/*.bak.*' '**/*.old' '**/*.orig'
+  '**/.git' '**/.git/**'
+  '**/__pycache__/**' '**/node_modules/**'
+  '**/*.log' '**/cache/**' '**/Cache/**'
+)
+
+# ---------------------------------------------------------------- ui
+
+c_reset=''; c_bold=''; c_dim=''; c_red=''; c_green=''; c_yellow=''
+if [[ -t 1 ]]; then
+  c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+  c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'
+fi
+
+say()  { printf '%s\n' "$*"; }
+head1() { printf '\n%s==> %s%s\n' "$c_bold" "$*" "$c_reset"; }
+info() { printf '    %s\n' "$*"; }
+dim()  { printf '    %s%s%s\n' "$c_dim" "$*" "$c_reset"; }
+ok()   { printf '    %s✓%s %s\n' "$c_green" "$c_reset" "$*"; }
+warn() { printf '    %s!%s %s\n' "$c_yellow" "$c_reset" "$*"; WARNINGS+=("$*"); }
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
+
+confirm() {
+  [[ $ASSUME_YES -eq 1 ]] && return 0
+  local reply
+  printf '\n%s%s%s [y/N] ' "$c_bold" "$1" "$c_reset"
+  read -r reply </dev/tty || return 1
+  [[ $reply == [yY] ]]
+}
+
+run() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dim "would run: $*"
+    return 0
+  fi
+  "$@"
+}
+
+usage() {
+  cat <<'EOF'
+omarchy-snapshot - snapshot your machine's configuration to a private git remote
+
+USAGE
+    omarchy-snapshot [OPTIONS]
+
+DESCRIPTION
+    Sets up mise's dotfile history to continuously track your configuration and
+    publish it to a private repository, so a fresh Omarchy install can be
+    restored with a single command.
+
+    Tracked:  config files, hand-written scripts, and a manifest of what to
+              reinstall (pacman packages, mise tools, third-party plugin repos).
+    Excluded: binaries, vendored plugins, caches, and anything credential-shaped.
+
+OPTIONS
+    --remote <owner/repo|url>  Publish to this repository. Created as private via
+                               gh if it does not exist.
+    --no-remote                Set up local history only, without publishing.
+    --max-binary-size <bytes>  Size above which a non-text file is excluded.
+                               Default: 1048576 (1 MiB).
+    -n, --dry-run              Show what would happen, change nothing.
+    -y, --yes                  Do not prompt for confirmation.
+    -h, --help                 Show this help.
+    -V, --version              Show version.
+
+RESTORING ONTO A FRESH MACHINE
+    mise bootstrap --adopt <owner/repo>
+
+IMPORTANT
+    Never push commits to the snapshot repository by hand. mise treats any commit
+    it did not author as an incoming change it cannot apply, which blocks
+    publication indefinitely and silently freezes your snapshot.
+EOF
+}
+
+# ---------------------------------------------------------------- preflight
+
+preflight() {
+  head1 "Checking prerequisites"
+
+  command -v mise >/dev/null || die "mise is not installed. See https://mise.jdx.dev"
+  command -v git  >/dev/null || die "git is not installed."
+
+  if ! mise dot --help >/dev/null 2>&1; then
+    die "this mise has no 'dot' command; dotfile history needs mise 2026.9.2 or newer (yours: $(mise --version 2>/dev/null | head -1))"
+  fi
+  ok "mise $(mise --version 2>/dev/null | awk '{print $1}') with dotfile history"
+
+  if [[ -n $REMOTE_ARG && $REMOTE_ARG != *://* && $REMOTE_ARG != git@* ]]; then
+    command -v gh >/dev/null || die "--remote '$REMOTE_ARG' needs the gh CLI to resolve, or pass a full git URL"
+  fi
+}
+
+# ---------------------------------------------------------------- helpers
+
+is_text_file() {
+  local mime
+  mime=$(file -b --mime-type -- "$1" 2>/dev/null) || return 1
+  case "$mime" in
+    text/*|application/json|application/xml|inode/x-empty) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+path_size() { stat -c%s -- "$1" 2>/dev/null || echo 0; }
+
+# Print ~/... for a path under $HOME.
+tildify() { printf '%s' "${1/#$HOME/\~}"; }
+
+add_exclude() {
+  local g
+  for g in "${EXCLUDE_GLOBS[@]:-}"; do [[ $g == "$1" ]] && return 0; done
+  EXCLUDE_GLOBS+=("$1")
+}
+
+add_track() {
+  local p
+  for p in "${TRACK_PATHS[@]:-}"; do [[ $p == "$1" ]] && return 0; done
+  TRACK_PATHS+=("$1")
+}
+
+# ---------------------------------------------------------------- discovery
+
+discover_config() {
+  head1 "Discovering configuration"
+
+  local entry path
+  for entry in "${CONFIG_CANDIDATES[@]}"; do
+    path="$HOME/.config/$entry"
+    [[ -e $path ]] || continue
+    # Skip directories that contain nothing.
+    if [[ -d $path ]] && [[ -z $(find "$path" -type f -print -quit 2>/dev/null) ]]; then
+      continue
+    fi
+    add_track "$(tildify "$path")"
+  done
+
+  for entry in "${HOME_CANDIDATES[@]}"; do
+    path="$HOME/$entry"
+    [[ -f $path ]] && add_track "$(tildify "$path")"
+  done
+
+  info "${#TRACK_PATHS[@]} configuration paths found"
+}
+
+discover_local_bin() {
+  local bin="$HOME/.local/bin"
+  [[ -d $bin ]] || return 0
+  head1 "Scanning ~/.local/bin"
+
+  local f size kept=0 dropped=0
+  while IFS= read -r -d '' f; do
+    size=$(path_size "$f")
+    if is_text_file "$f" && (( size <= MAX_BINARY_BYTES )); then
+      kept=$((kept + 1))
+    else
+      add_exclude "$(tildify "$f")"
+      dropped=$((dropped + 1))
+      dim "excluding $(basename "$f") ($(numfmt --to=iec-i --suffix=B "$size" 2>/dev/null || echo "$size bytes"))"
+    fi
+  done < <(find "$bin" -maxdepth 1 -type f -print0 2>/dev/null)
+
+  add_exclude '~/.local/bin/__pycache__/**'
+  [[ $kept -gt 0 ]] && add_track '~/.local/bin'
+  info "$kept script(s) tracked, $dropped binary/large file(s) excluded"
+}
+
+# Omarchy names a plugin you cloned "<username>.<plugin>", so the prefix - not
+# the size - says whose it is. Third-party plugins are excluded; those that are
+# git checkouts get their URL recorded so a restore can clone them again.
+discover_plugins() {
+  local plugdir="$HOME/.config/omarchy/plugins"
+  [[ -d $plugdir ]] || return 0
+  head1 "Classifying Omarchy plugins"
+
+  local d name url
+  for d in "$plugdir"/*/; do
+    [[ -d $d ]] || continue
+    d=${d%/}
+    name=$(basename "$d")
+
+    if [[ $name == "$USER".* ]]; then
+      dim "$name -> tracked (yours)"
+      continue
+    fi
+
+    add_exclude "$(tildify "$d")"
+    add_exclude "$(tildify "$d")/**"
+
+    url=$(git -C "$d" remote get-url origin 2>/dev/null || true)
+    if [[ -n $url ]]; then
+      REPO_PATHS+=("$(tildify "$d")")
+      REPO_URLS+=("$url")
+      dim "$name -> reinstalled from $url"
+    else
+      warn "plugin '$name' is third-party but has no git remote - excluded, and nothing records how to reinstall it"
+    fi
+  done
+}
+
+discover_secrets() {
+  head1 "Excluding credentials and noise"
+  local g
+  for g in "${SECRET_GLOBS[@]}"; do add_exclude "$g"; done
+  for g in "${NOISE_GLOBS[@]}"; do add_exclude "$g"; done
+  info "${#SECRET_GLOBS[@]} credential pattern(s), ${#NOISE_GLOBS[@]} noise pattern(s)"
+}
+
+# Directories that look small but hold session state, cookies or tokens. Never
+# suggest these: a browser profile is not configuration.
+APP_STATE_PATTERNS=(
+  'BraveSoftware' 'chromium' 'google-chrome*' 'microsoft-edge*' 'vivaldi*'
+  'opera*' 'firefox' 'thorium*' 'Codex' 'obsidian' 'spotify' 'discord'
+  'slack' 'Slack' 'dconf' 'pulse' 'wireplumber' 'gnome-keyring' 'keyrings'
+  'session' 'autostart' 'menus'
+)
+
+# Anything in ~/.config that is neither tracked nor obviously application state.
+report_unlisted() {
+  local d name count listed entry
+  local -a suggestions=()
+  local file_cap=150
+
+  for d in "$HOME"/.config/*/; do
+    [[ -d $d ]] || continue
+    name=$(basename "${d%/}")
+    listed=0
+    for entry in "${CONFIG_CANDIDATES[@]}"; do
+      [[ $entry == "$name" || $entry == "$name"/* ]] && listed=1 && break
+    done
+    [[ $listed -eq 1 ]] && continue
+
+    for entry in "${APP_STATE_PATTERNS[@]}"; do
+      # shellcheck disable=SC2053
+      [[ $name == $entry ]] && listed=1 && break
+    done
+    [[ $listed -eq 1 ]] && continue
+
+    # Counting a bounded number of files is cheap; `du` here would walk
+    # multi-gigabyte application profiles such as browser state. `head` closing
+    # the pipe kills `find` with SIGPIPE, so pipefail must not see it.
+    set +o pipefail
+    count=$(find "$d" -type f 2>/dev/null | head -n "$file_cap" | wc -l)
+    set -o pipefail
+    (( count > 0 && count < file_cap )) && suggestions+=("$name")
+  done
+
+  if (( ${#suggestions[@]} > 0 )); then
+    head1 "Not tracked, but small enough to be configuration"
+    dim "${suggestions[*]}"
+    dim "add any you want with: mise dot track ~/.config/<name>"
+  fi
+}
+
+# ---------------------------------------------------------------- plan
+
+show_plan() {
+  head1 "Plan"
+  say ""
+  say "  ${c_bold}Track${c_reset} (${#TRACK_PATHS[@]} paths)"
+  local p
+  for p in "${TRACK_PATHS[@]}"; do say "    $p"; done
+
+  say ""
+  say "  ${c_bold}Exclude${c_reset} (${#EXCLUDE_GLOBS[@]} globs)"
+  local g shown=0
+  for g in "${EXCLUDE_GLOBS[@]}"; do
+    (( shown < 12 )) && { say "    $g"; shown=$((shown + 1)); }
+  done
+  (( ${#EXCLUDE_GLOBS[@]} > shown )) && dim "... and $(( ${#EXCLUDE_GLOBS[@]} - shown )) more"
+
+  if (( ${#REPO_PATHS[@]} > 0 )); then
+    say ""
+    say "  ${c_bold}Reinstalled from git${c_reset} (${#REPO_PATHS[@]})"
+    local i
+    for i in "${!REPO_PATHS[@]}"; do say "    ${REPO_PATHS[$i]} <- ${REPO_URLS[$i]}"; done
+  fi
+
+  if command -v pacman >/dev/null; then
+    say ""
+    say "  ${c_bold}Package manifest${c_reset}"
+    say "    $(pacman -Qqe 2>/dev/null | wc -l) explicitly installed pacman packages"
+  fi
+}
+
+# ---------------------------------------------------------------- apply
+
+apply_excludes() {
+  head1 "Applying exclusions"
+  # Exclusions must be registered before tracking, so nothing secret is ever
+  # captured into history in the first place.
+  local g
+  for g in "${EXCLUDE_GLOBS[@]}"; do
+    run mise dot exclude "$g" >/dev/null 2>&1 || warn "could not exclude $g"
+  done
+  ok "${#EXCLUDE_GLOBS[@]} exclusion(s) registered"
+}
+
+apply_tracking() {
+  head1 "Tracking configuration"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dim "would track ${#TRACK_PATHS[@]} paths"
+    return 0
+  fi
+  local p
+  for p in "${TRACK_PATHS[@]}"; do
+    mise dot track -y "$p" >/dev/null 2>&1 || warn "could not track $p"
+  done
+  ok "${#TRACK_PATHS[@]} path(s) tracked"
+}
+
+write_generated_config() {
+  head1 "Writing restore manifest"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dim "would write $GENERATED_CONFIG"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$GENERATED_CONFIG")"
+  local tmp
+  tmp=$(mktemp)
+
+  {
+    echo "# Generated by omarchy-snapshot $VERSION on $(date -Iseconds)."
+    echo "# This file is rewritten on every run; edit your own config.toml instead."
+    echo
+    echo "[bootstrap.services.mise-history]"
+    echo 'builtin = "history-watch"'
+
+    if (( ${#REPO_PATHS[@]} > 0 )); then
+      echo
+      echo "[bootstrap.repos]"
+      local i
+      for i in "${!REPO_PATHS[@]}"; do
+        printf '"%s" = { url = "%s" }\n' "${REPO_PATHS[$i]}" "${REPO_URLS[$i]}"
+      done
+    fi
+
+    if command -v pacman >/dev/null; then
+      echo
+      echo "[bootstrap.packages]"
+      local pkg
+      while IFS= read -r pkg; do
+        [[ -n $pkg ]] && printf '"pacman:%s" = "latest"\n' "$pkg"
+      done < <(pacman -Qqe 2>/dev/null | sort)
+    fi
+  } > "$tmp"
+
+  mv "$tmp" "$GENERATED_CONFIG"
+  chmod 644 "$GENERATED_CONFIG"
+  ok "wrote $(tildify "$GENERATED_CONFIG")"
+}
+
+start_watcher() {
+  head1 "Starting the history watcher"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dim "would run: mise bootstrap --only services -y"
+    return 0
+  fi
+  if mise bootstrap --only services -y >/dev/null 2>&1; then
+    ok "watcher service installed"
+  else
+    warn "could not install the watcher service; run 'mise bootstrap' by hand"
+  fi
+}
+
+# mise pushes from a background service, so git needs a credential helper that
+# does not depend on an interactive terminal. gh's own setup writes a versioned
+# path that breaks the next time gh is upgraded; point at a stable one instead.
+ensure_git_credentials() {
+  command -v gh >/dev/null || return 0
+  gh auth status >/dev/null 2>&1 || return 0
+
+  local helper existing
+  helper=$(command -v gh)
+  # Prefer a stable shim over a version-pinned install path.
+  if [[ -x "$HOME/.local/share/mise/shims/gh" ]]; then
+    helper="$HOME/.local/share/mise/shims/gh"
+  fi
+
+  existing=$(git config --global --get 'credential.https://github.com.helper' 2>/dev/null || true)
+  if [[ $existing == *"/installs/"* || -z $existing ]]; then
+    run git config --global --replace-all 'credential.https://github.com.helper' "!$helper auth git-credential"
+    ok "git credential helper -> $(tildify "$helper")"
+  fi
+}
+
+setup_remote() {
+  [[ $SKIP_REMOTE -eq 1 ]] && return 0
+
+  local url="$REMOTE_ARG"
+  if [[ -z $url ]]; then
+    return 0
+  fi
+
+  head1 "Connecting the remote"
+  ensure_git_credentials
+
+  # owner/repo shorthand: create it privately if it does not exist yet.
+  if [[ $url != *://* && $url != git@* ]]; then
+    if ! gh repo view "$url" >/dev/null 2>&1; then
+      info "creating private repository $url"
+      run gh repo create "$url" --private \
+        --description "Machine configuration snapshot (omarchy-snapshot)" >/dev/null \
+        || die "could not create $url"
+    fi
+    url="https://github.com/$url.git"
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    dim "would run: mise dot origin set --yes --sync sync $url"
+    return 0
+  fi
+
+  if mise dot origin set --yes --sync sync "$url"; then
+    ok "publishing to $url"
+  else
+    warn "could not connect $url; check 'git ls-remote $url' and rerun"
+  fi
+}
+
+# ---------------------------------------------------------------- verify
+
+verify() {
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  [[ $SKIP_REMOTE -eq 1 || -z $REMOTE_ARG ]] && return 0
+
+  head1 "Verifying what was published"
+
+  local url tmp
+  url=$(mise dot status 2>/dev/null | sed -n 's/.*Setup repository: \([^ ]*\).*/\1/p' | head -1)
+  [[ -n $url ]] || { warn "no remote recorded; skipping verification"; return 0; }
+
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  if ! git clone -q --depth 1 "$url" "$tmp/repo" 2>/dev/null; then
+    warn "could not clone $url to verify"
+    return 0
+  fi
+
+  local big
+  big=$(find "$tmp/repo" -path "$tmp/repo/.git" -prune -o -type f -size +"$((MAX_BINARY_BYTES / 1024))"k -print 2>/dev/null | head -5)
+  if [[ -n $big ]]; then
+    warn "published files larger than the binary threshold:"
+    printf '        %s\n' $big
+  else
+    ok "no oversized files published"
+  fi
+
+  if grep -rIlE 'gh[pous]_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY|aws_secret_access_key' \
+      "$tmp/repo" --exclude-dir=.git >/dev/null 2>&1; then
+    warn "possible credential material found in the published repository - inspect $url immediately"
+  else
+    ok "no credential patterns found"
+  fi
+
+  ok "$(find "$tmp/repo/home" -type f 2>/dev/null | wc -l) file(s) published"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote)           REMOTE_ARG="${2:-}"; shift 2 ;;
+      --no-remote)        SKIP_REMOTE=1; shift ;;
+      --max-binary-size)  MAX_BINARY_BYTES="${2:-}"; shift 2 ;;
+      -n|--dry-run)       DRY_RUN=1; shift ;;
+      -y|--yes)           ASSUME_YES=1; shift ;;
+      -h|--help)          usage; exit 0 ;;
+      -V|--version)       echo "omarchy-snapshot $VERSION"; exit 0 ;;
+      *)                  die "unknown option: $1 (try --help)" ;;
+    esac
+  done
+
+  say "${c_bold}omarchy-snapshot $VERSION${c_reset}"
+  [[ $DRY_RUN -eq 1 ]] && dim "dry run - nothing will be changed"
+
+  preflight
+  discover_secrets
+  discover_config
+  discover_local_bin
+  discover_plugins
+  show_plan
+
+  if [[ $DRY_RUN -eq 0 ]]; then
+    confirm "Apply this plan?" || { say "aborted."; exit 0; }
+  fi
+
+  apply_excludes
+  apply_tracking
+  write_generated_config
+  start_watcher
+  setup_remote
+  verify
+  report_unlisted
+
+  head1 "Done"
+  if (( ${#WARNINGS[@]} > 0 )); then
+    say ""
+    say "  ${c_yellow}${#WARNINGS[@]} warning(s):${c_reset}"
+    printf '    - %s\n' "${WARNINGS[@]}"
+  fi
+
+  cat <<EOF
+
+  Your configuration is now checkpointed automatically as you edit it.
+
+    mise dot status                # what is tracked, watcher health
+    mise dot history               # checkpoints, newest first
+    mise dot history diff <a> <b>  # what changed between two
+
+  Restore onto a fresh machine:
+
+    mise bootstrap --adopt <owner/repo>
+
+  Never push to the snapshot repository by hand - mise cannot apply commits it
+  did not author, and publication stops until they are removed.
+EOF
+}
+
+main "$@"
