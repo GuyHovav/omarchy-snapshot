@@ -252,13 +252,20 @@ discover_plugins() {
   [[ -d $plugdir ]] || return 0
   head1 "Classifying Omarchy plugins"
 
-  local d name url
+  # A plugin named <you>.something is yours. $USER is not always exported - cron,
+  # systemd units and `env -u USER` all leave it unset, which under `set -u` was
+  # fatal here - so fall back to the passwd database, and if even that fails,
+  # simply classify nothing as yours rather than matching every plugin.
+  local d name url me
+  me=${USER:-}
+  [[ -n $me ]] || me=$(id -un 2>/dev/null || true)
+
   for d in "$plugdir"/*/; do
     [[ -d $d ]] || continue
     d=${d%/}
     name=$(basename "$d")
 
-    if [[ $name == "$USER".* ]]; then
+    if [[ -n $me && $name == "$me".* ]]; then
       dim "$name -> tracked (yours)"
       continue
     fi
