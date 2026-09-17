@@ -139,7 +139,10 @@ as the repository name and the tool proceeded in live mode.
   causes an abort. That is a safe default but an accidental one, not a designed one.
 - **The verification step is a backstop, not a proof.** It scans for a handful of
   credential patterns in a shallow clone. It will not catch an unusual secret format, and
-  it does not inspect history, only the tip.
+  it does not inspect history, only the tip. It does now clone the branch mise actually
+  publishes to and refuse to report an all-clear over an empty checkout - previously a
+  remote whose default HEAD differed from that branch produced three passing checks that
+  had examined nothing at all.
 - **`CONFIG_CANDIDATES` is a curated list.** It will silently miss configuration for tools
   nobody thought of. The "small enough to be configuration" report is the mitigation, and
   it is heuristic.
